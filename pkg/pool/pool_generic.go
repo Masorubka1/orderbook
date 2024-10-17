@@ -82,7 +82,6 @@ func NewItemChanV2[T any](size uint64) *ItemChanV2[T] {
 func (c *ItemChanV2[T]) Put(value *T) {
 	// Wait for the reader to catch up if the channel is full
 	for atomic.LoadUint64(&c.nextFreeIndex)+1 > (atomic.LoadUint64(&c.readerIndex) + c.indexMask) {
-		println("Here2")
 		runtime.Gosched()
 	}
 
@@ -92,7 +91,6 @@ func (c *ItemChanV2[T]) Put(value *T) {
 
 	// Update the last committed index to make the item available for reading
 	for !atomic.CompareAndSwapUint64(&c.lastCommittedIndex, myIndex-1, myIndex) {
-		println("Here3")
 		runtime.Gosched()
 	}
 }
@@ -101,7 +99,6 @@ func (c *ItemChanV2[T]) Put(value *T) {
 func (c *ItemChanV2[T]) Read() *T {
 	// Wait for a committed item if the reader has outpaced the writer
 	for atomic.LoadUint64(&c.readerIndex)+1 > atomic.LoadUint64(&c.lastCommittedIndex) {
-		println("Here4")
 		runtime.Gosched()
 	}
 
