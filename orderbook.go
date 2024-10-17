@@ -59,8 +59,8 @@ func Uint64Cmp(a, b uint64) int {
 // NewOrderBook creates Orderbook object
 func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 	ob := &OrderBook{
-		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
-		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
+		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
+		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
 		trigQueue:    queue.NewQueue(10000),
 		bids:         newPriceLevel(BidPrice),
 		asks:         newPriceLevel(AskPrice),
@@ -74,8 +74,6 @@ func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 
 	oPool = pool.NewItemPoolV2[Order](ob.orderPoolSize)
 	oqPool = pool.NewItemPoolV2[orderQueue](ob.orderQueuePoolSize)
-	ob.orders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.nodeTreePoolSize)
-	ob.trigOrders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.nodeTreePoolSize)
 
 	return ob
 }
