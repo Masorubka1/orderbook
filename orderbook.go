@@ -1,11 +1,14 @@
 package orderbook
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/geseq/orderbook/pkg/pool"
 	local_tree "github.com/geseq/orderbook/pkg/tree"
+
 	decimal "github.com/geseq/udecimal"
+	queue "github.com/yireyun/go-queue"
 )
 
 // NotificationHandler handles notification updates
@@ -25,7 +28,7 @@ type OrderBook struct {
 	triggerOver  *priceLevel                      // orders that trigger over last price i.e. Stop Buy or Take Sell
 	orders       *local_tree.Tree[uint64, *Order] // orderId -> *Order
 	trigOrders   *local_tree.Tree[uint64, *Order] // orderId -> *Order
-	trigQueue    *triggerQueue
+	trigQueue    *queue.EsQueue
 
 	notification NotificationHandler
 
@@ -38,6 +41,8 @@ type OrderBook struct {
 	nodeTreePoolSize      uint64
 	orderTreeNodePoolSize uint64
 	orderQueuePoolSize    uint64
+
+	mu sync.Mutex
 }
 
 // Uint64Cmp compares two uint64.
@@ -54,9 +59,9 @@ func Uint64Cmp(a, b uint64) int {
 // NewOrderBook creates Orderbook object
 func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 	ob := &OrderBook{
-		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
-		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
-		trigQueue:    newTriggerQueue(),
+		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
+		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
+		trigQueue:    queue.NewQueue(10000),
 		bids:         newPriceLevel(BidPrice),
 		asks:         newPriceLevel(AskPrice),
 		triggerUnder: newPriceLevel(TrigPrice),
@@ -69,6 +74,8 @@ func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 
 	oPool = pool.NewItemPoolV2[Order](ob.orderPoolSize)
 	oqPool = pool.NewItemPoolV2[orderQueue](ob.orderQueuePoolSize)
+	ob.orders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.nodeTreePoolSize)
+	ob.trigOrders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.nodeTreePoolSize)
 
 	return ob
 }
@@ -148,46 +155,51 @@ func (ob *OrderBook) AddOrder(tok, id uint64, class ClassType, side SideType, qu
 }
 
 func (ob *OrderBook) addTrigOrder(id uint64, class ClassType, side SideType, quantity, price, stPrice decimal.Decimal, flag FlagType) {
-	switch flag {
-	case StopLoss:
-		switch side {
-		case Buy:
-			if stPrice.LessThanOrEqual(ob.lastPrice) {
-				// Stop buy set under stop price, condition satisfied to trigger
-				ob.processOrder(id, class, side, quantity, price, flag)
-				return
-			}
+	var shouldTriggerNow bool
 
-			ob.trigOrders.Put(id, ob.triggerOver.Append(NewOrder(id, class, side, quantity, price, stPrice, flag)))
-		case Sell:
-			if ob.lastPrice.LessThanOrEqual(stPrice) {
-				// Stop sell set over stop price, condition satisfied to trigger
-				ob.processOrder(id, class, side, quantity, price, flag)
-				return
+	triggerNowConditions := [2]func() bool{
+		// Sell
+		func() bool {
+			if flag == StopLoss {
+				return ob.lastPrice.LessThanOrEqual(stPrice)
 			}
-
-			ob.trigOrders.Put(id, ob.triggerUnder.Append(NewOrder(id, class, side, quantity, price, stPrice, flag)))
-		}
-	case TakeProfit:
-		switch side {
-		case Buy:
-			if ob.lastPrice.LessThanOrEqual(stPrice) {
-				// Stop buy set under stop price, condition satisfied to trigger
-				ob.processOrder(id, class, side, quantity, price, flag)
-				return
+			return stPrice.LessThanOrEqual(ob.lastPrice)
+		},
+		// Buy
+		func() bool {
+			if flag == StopLoss {
+				return stPrice.LessThanOrEqual(ob.lastPrice)
 			}
-
-			ob.trigOrders.Put(id, ob.triggerUnder.Append(NewOrder(id, class, side, quantity, price, stPrice, flag)))
-		case Sell:
-			if stPrice.LessThanOrEqual(ob.lastPrice) {
-				// Stop sell set over stop price, condition satisfied to trigger
-				ob.processOrder(id, class, side, quantity, price, flag)
-				return
-			}
-
-			ob.trigOrders.Put(id, ob.triggerOver.Append(NewOrder(id, class, side, quantity, price, stPrice, flag)))
-		}
+			return ob.lastPrice.LessThanOrEqual(stPrice)
+		},
 	}
+
+	triggerPriceLevels := [2]*priceLevel{
+		// Sell
+		func() *priceLevel {
+			if flag == StopLoss {
+				return ob.triggerUnder
+			}
+			return ob.triggerOver
+		}(),
+		// Buy
+		func() *priceLevel {
+			if flag == StopLoss {
+				return ob.triggerOver
+			}
+			return ob.triggerUnder
+		}(),
+	}
+
+	shouldTriggerNow = triggerNowConditions[side]()
+
+	if shouldTriggerNow {
+		ob.processOrder(id, class, side, quantity, price, flag)
+		return
+	}
+
+	newOrder := NewOrder(id, class, side, quantity, price, stPrice, flag)
+	ob.trigOrders.Put(id, triggerPriceLevels[side].Append(newOrder))
 }
 
 func (ob *OrderBook) postProcess(lp decimal.Decimal) {
@@ -201,23 +213,19 @@ func (ob *OrderBook) postProcess(lp decimal.Decimal) {
 func (ob *OrderBook) processOrder(id uint64, class ClassType, side SideType, quantity, price decimal.Decimal, flag FlagType) {
 	lp := ob.lastPrice
 
-	if class == Market {
-		if side == Buy {
-			ob.asks.processMarketOrder(ob, id, quantity, flag)
-		} else {
-			ob.bids.processMarketOrder(ob, id, quantity, flag)
-		}
+	sidePriceLevel := [2]*priceLevel{ob.bids, ob.asks}
+	sideFunc := [2]func(decimal.Decimal) bool{
+		price.LessThanOrEqual,
+		price.GreaterThanOrEqual,
+	}
 
+	if class == Market {
+		sidePriceLevel[side].processMarketOrder(ob, id, quantity, flag)
 		ob.postProcess(lp)
 		return
 	}
 
-	var qtyProcessed decimal.Decimal
-	if side == Buy {
-		qtyProcessed = ob.asks.processLimitOrder(ob, price.GreaterThanOrEqual, id, quantity, flag)
-	} else {
-		qtyProcessed = ob.bids.processLimitOrder(ob, price.LessThanOrEqual, id, quantity, flag)
-	}
+	qtyProcessed := sidePriceLevel[side].processLimitOrder(ob, sideFunc[side], id, quantity, flag)
 
 	if flag == IoC || flag == FoK {
 		ob.postProcess(lp)
@@ -227,11 +235,7 @@ func (ob *OrderBook) processOrder(id uint64, class ClassType, side SideType, qua
 	quantityLeft := quantity.Sub(qtyProcessed)
 	if quantityLeft.GreaterThan(decimal.Zero) {
 		o := NewOrder(id, class, side, quantityLeft, price, decimal.Zero, flag)
-		if side == Buy {
-			ob.orders.Put(id, ob.bids.Append(o))
-		} else {
-			ob.orders.Put(id, ob.asks.Append(o))
-		}
+		ob.orders.Put(id, sidePriceLevel[side.Invert()].Append(o))
 	}
 
 	ob.postProcess(lp)
@@ -249,7 +253,13 @@ func (ob *OrderBook) queueTriggeredOrders() {
 		for q.Len() > 0 {
 			o := q.Head()
 			ob.triggerOver.Remove(o)
-			ob.trigQueue.Push(o)
+			ob.trigOrders.Remove(o.ID)
+			for {
+				ok, _ := ob.trigQueue.Put(o)
+				if ok {
+					break
+				}
+			}
 		}
 	}
 
@@ -257,14 +267,30 @@ func (ob *OrderBook) queueTriggeredOrders() {
 		for q.Len() > 0 {
 			o := q.Head()
 			ob.triggerUnder.Remove(o)
-			ob.trigQueue.Push(o)
+			ob.trigOrders.Remove(o.ID)
+			for {
+				ok, _ := ob.trigQueue.Put(o)
+				if ok {
+					break
+				}
+			}
 		}
 	}
 }
 
 func (ob *OrderBook) processTriggeredOrders() {
-	for o := ob.trigQueue.Pop(); o != nil; o = ob.trigQueue.Pop() {
+	for {
+		order, ok, _ := ob.trigQueue.Get()
+		if !ok {
+			break
+		}
+		o := order.(*Order)
 		ob.processOrder(o.ID, o.Class, o.Side, o.Qty, o.Price, o.Flag)
+
+		_, exists := ob.trigOrders.Get(o.ID)
+		if !exists {
+			o.Release()
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ require (
 	github.com/geseq/udecimal v0.0.0-20211126195629-659dde5a92d8
 	github.com/loov/hrtime v1.0.3
 	github.com/stretchr/testify v1.8.0
+	github.com/yireyun/go-queue v0.0.0-20220725040158-a4dd64810e1e
 	golang.org/x/sys v0.26.0
 	golang.org/x/text v0.19.0
 )

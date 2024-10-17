@@ -15,3 +15,12 @@ func (s SideType) String() string {
 		return "sell"
 	}
 }
+
+func (s SideType) Invert() SideType {
+	switch s {
+	case Buy:
+		return Sell
+	default:
+		return Buy
+	}
+}
