@@ -14,8 +14,8 @@ type NotificationHandler interface {
 	PutTrade(makerOrderID, takerOrderID uint64, makerStatus, takerStatus OrderStatus, qty, price decimal.Decimal)
 }
 
-var oPool = pool.NewItemPoolV2[Order](100)
-var oqPool = pool.NewItemPoolV2[orderQueue](10)
+var oPool = pool.NewItemPoolV2[Order](1)
+var oqPool = pool.NewItemPoolV2[orderQueue](1)
 
 // OrderBook implements standard matching algorithm
 type OrderBook struct {
@@ -54,8 +54,8 @@ func Uint64Cmp(a, b uint64) int {
 // NewOrderBook creates Orderbook object
 func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 	ob := &OrderBook{
-		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
-		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 2),
+		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
+		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
 		trigQueue:    newTriggerQueue(),
 		bids:         newPriceLevel(BidPrice),
 		asks:         newPriceLevel(AskPrice),
@@ -69,6 +69,8 @@ func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 
 	oPool = pool.NewItemPoolV2[Order](ob.orderPoolSize)
 	oqPool = pool.NewItemPoolV2[orderQueue](ob.orderQueuePoolSize)
+	ob.orders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.orderTreeNodePoolSize)
+	ob.trigOrders = local_tree.NewWithTree[uint64, *Order](Uint64Cmp, ob.orderTreeNodePoolSize)
 
 	return ob
 }
@@ -284,8 +286,8 @@ func (ob *OrderBook) CancelOrder(tok, orderID uint64) {
 
 // CancelOrder removes order with given ID from the order book
 func (ob *OrderBook) cancelOrder(orderID uint64) *Order {
-	o, ok := ob.orders.Get(orderID)
 	priceLevelMap := [2]*priceLevel{ob.asks, ob.bids}
+	o, ok := ob.orders.Get(orderID)
 	if !ok {
 		return ob.cancelTrigOrders(orderID)
 	}
