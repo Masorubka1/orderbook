@@ -150,49 +150,32 @@ func (ob *OrderBook) AddOrder(tok, id uint64, class ClassType, side SideType, qu
 }
 
 func (ob *OrderBook) addTrigOrder(o *Order) {
-	switch o.Flag {
-	case StopLoss:
-		switch o.Side {
-		case Buy:
-			if o.TrigPrice.LessThanOrEqual(ob.lastPrice) {
-				// Stop buy set under stop price, condition satisfied to trigger
-				ob.processOrder(o)
-				return
-			}
+	flagIdx := int(o.Flag>>1) % 2
+	if o.Flag == TakeProfit {
+		flagIdx = 1
+	}
+	sideIdx := int(o.Side+1) % 2
 
-			triggerOrder := NewOrder(o.ID, o.Class, o.Side, o.Qty, o.Price, o.TrigPrice, o.Flag)
-			ob.trigOrders.Put(o.ID, ob.triggerOver.Append(triggerOrder))
-		case Sell:
-			if ob.lastPrice.LessThanOrEqual(o.TrigPrice) {
-				// Stop sell set over stop price, condition satisfied to trigger
-				ob.processOrder(o)
-				return
-			}
+	pls := [2][2]*priceLevel{
+		// StopLoss:    Buy               Sell
+		{ob.triggerOver, ob.triggerUnder},
+		// TakeProfit:  Buy               Sell
+		{ob.triggerUnder, ob.triggerOver},
+	}
 
-			triggerOrder := NewOrder(o.ID, o.Class, o.Side, o.Qty, o.Price, o.TrigPrice, o.Flag)
-			ob.trigOrders.Put(o.ID, ob.triggerUnder.Append(triggerOrder))
-		}
-	case TakeProfit:
-		switch o.Side {
-		case Buy:
-			if ob.lastPrice.LessThanOrEqual(o.TrigPrice) {
-				// Stop buy set under stop price, condition satisfied to trigger
-				ob.processOrder(o)
-				return
-			}
+	// 3) true=TrigPrice<=lastPrice, false=lastPrice<=TrigPrice
+	useTrLE := [2][2]bool{
+		{true, false},
+		{false, true},
+	}
 
-			triggerOrder := NewOrder(o.ID, o.Class, o.Side, o.Qty, o.Price, o.TrigPrice, o.Flag)
-			ob.trigOrders.Put(o.ID, ob.triggerUnder.Append(triggerOrder))
-		case Sell:
-			if o.TrigPrice.LessThanOrEqual(ob.lastPrice) {
-				// Stop sell set over stop price, condition satisfied to trigger
-				ob.processOrder(o)
-				return
-			}
+	le := o.TrigPrice.LessThanOrEqual(ob.lastPrice)
+	ge := ob.lastPrice.LessThanOrEqual(o.TrigPrice)
 
-			triggerOrder := NewOrder(o.ID, o.Class, o.Side, o.Qty, o.Price, o.TrigPrice, o.Flag)
-			ob.trigOrders.Put(o.ID, ob.triggerOver.Append(triggerOrder))
-		}
+	if (useTrLE[flagIdx][sideIdx] && le) || (!useTrLE[flagIdx][sideIdx] && ge) {
+		ob.processOrder(o)
+	} else {
+		ob.trigOrders.Put(o.ID, pls[flagIdx][sideIdx].Append(o))
 	}
 }
 
@@ -206,24 +189,16 @@ func (ob *OrderBook) postProcess(lp decimal.Decimal) {
 
 func (ob *OrderBook) processOrder(o *Order) {
 	lp := ob.lastPrice
+	priceLevelMap := [2]*priceLevel{ob.bids, ob.asks}
+	cmpPriceMap := [2]func(decimal.Decimal) bool{o.Price.LessThanOrEqual, o.Price.GreaterThanOrEqual}
 
 	if o.Class == Market {
-		if o.Side == Buy {
-			ob.asks.processMarketOrder(ob, o.ID, o.Qty, o.Flag)
-		} else {
-			ob.bids.processMarketOrder(ob, o.ID, o.Qty, o.Flag)
-		}
-
+		priceLevelMap[o.Side].processMarketOrder(ob, o.ID, o.Qty, o.Flag)
 		ob.postProcess(lp)
 		return
 	}
 
-	var qtyProcessed decimal.Decimal
-	if o.Side == Buy {
-		qtyProcessed = ob.asks.processLimitOrder(ob, o.Price.GreaterThanOrEqual, o.ID, o.Qty, o.Flag)
-	} else {
-		qtyProcessed = ob.bids.processLimitOrder(ob, o.Price.LessThanOrEqual, o.ID, o.Qty, o.Flag)
-	}
+	qtyProcessed := priceLevelMap[o.Side].processLimitOrder(ob, cmpPriceMap[o.Side], o.ID, o.Qty, o.Flag)
 
 	if o.Flag == IoC || o.Flag == FoK {
 		ob.postProcess(lp)
@@ -233,11 +208,7 @@ func (ob *OrderBook) processOrder(o *Order) {
 	quantityLeft := o.Qty.Sub(qtyProcessed)
 	if quantityLeft.GreaterThan(decimal.Zero) {
 		o := NewOrder(o.ID, o.Class, o.Side, quantityLeft, o.Price, decimal.Zero, o.Flag)
-		if o.Side == Buy {
-			ob.orders.Put(o.ID, ob.bids.Append(o))
-		} else {
-			ob.orders.Put(o.ID, ob.asks.Append(o))
-		}
+		ob.orders.Put(o.ID, priceLevelMap[(o.Side+1)%2].Append(o))
 	}
 
 	ob.postProcess(lp)
