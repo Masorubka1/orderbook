@@ -7,13 +7,15 @@ import (
 	"github.com/geseq/udecimal"
 )
 
-type colorTree bool
-
+// Number is the constraint for key types supported by the tree.
 type Number interface {
 	int | int64 | uint64 | udecimal.Decimal
 }
 
+// comparatorTree defines how to compare two keys of type K.
 type comparatorTree[K Number] func(a, b K) int
+
+type colorTree bool
 
 const (
 	blackTree, redTree colorTree = true, false
