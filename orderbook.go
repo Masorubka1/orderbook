@@ -199,10 +199,14 @@ func (ob *OrderBook) postProcess(lp decimal.Decimal) {
 func (ob *OrderBook) processOrder(o *Order) {
 	lp := ob.lastPrice
 	priceLevelMap := [2]*priceLevel{ob.bids, ob.asks}
-	cmpPriceMap := [2]func(decimal.Decimal) bool{o.Price.LessThanOrEqual, o.Price.GreaterThanOrEqual}
 
 	pl := priceLevelMap[o.Side]
-	cmp := cmpPriceMap[o.Side]
+	var cmp func(decimal.Decimal) bool
+	if o.Side == Buy {
+		cmp = o.Price.GreaterThanOrEqual
+	} else {
+		cmp = o.Price.LessThanOrEqual
+	}
 
 	if o.Class == Market {
 		pl.processMarketOrder(ob, o.ID, o.Qty, o.Flag)
