@@ -192,27 +192,25 @@ func (ob *OrderBook) processOrder(o *Order) {
 	priceLevelMap := [2]*priceLevel{ob.bids, ob.asks}
 	cmpPriceMap := [2]func(decimal.Decimal) bool{o.Price.LessThanOrEqual, o.Price.GreaterThanOrEqual}
 
+	pl := priceLevelMap[o.Side]
+	cmp := cmpPriceMap[o.Side]
+
 	if o.Class == Market {
-		priceLevelMap[o.Side].processMarketOrder(ob, o.ID, o.Qty, o.Flag)
-		ob.postProcess(lp)
-		return
-	}
+		pl.processMarketOrder(ob, o.ID, o.Qty, o.Flag)
+	} else {
+		executed := pl.processLimitOrder(ob, cmp, o.ID, o.Qty, o.Flag)
 
-	qtyProcessed := priceLevelMap[o.Side].processLimitOrder(ob, cmpPriceMap[o.Side], o.ID, o.Qty, o.Flag)
-
-	if o.Flag == IoC || o.Flag == FoK {
-		ob.postProcess(lp)
-		return
-	}
-
-	quantityLeft := o.Qty.Sub(qtyProcessed)
-	if quantityLeft.GreaterThan(decimal.Zero) {
-		o := NewOrder(o.ID, o.Class, o.Side, quantityLeft, o.Price, decimal.Zero, o.Flag)
-		ob.orders.Put(o.ID, priceLevelMap[(o.Side+1)%2].Append(o))
+		// 3) If not IoC/FoK — put rest to the oposite side orderbook
+		if o.Flag&(IoC|FoK) == 0 {
+			if rem := o.Qty.Sub(executed); rem.GreaterThan(decimal.Zero) {
+				newO := NewOrder(o.ID, o.Class, o.Side, rem, o.Price, decimal.Zero, o.Flag)
+				opposite := priceLevelMap[1-o.Side]
+				ob.orders.Put(newO.ID, opposite.Append(newO))
+			}
+		}
 	}
 
 	ob.postProcess(lp)
-	return
 }
 
 func (ob *OrderBook) queueTriggeredOrders() {
