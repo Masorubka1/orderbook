@@ -151,32 +151,38 @@ func (ob *OrderBook) AddOrder(
 }
 
 func (ob *OrderBook) addTrigOrder(o *Order) {
-	flagIdx := int(o.Flag>>1) % 2
-	if o.Flag == TakeProfit {
-		flagIdx = 1
-	}
-	sideIdx := int(o.Side+1) % 2
+	// Compute flag and side indices
+	// flagIdx: 0 = StopLoss, 1 = TakeProfit (assuming o.Flag>>5 yields 0 or 1)
+	// sideIdx: 1 - o.Side flips Buy=0→1, Sell=1→0
+	flagIdx := int(o.Flag >> 5)
+	sideIdx := int(1 - o.Side)
 
-	pls := [2][2]*priceLevel{
-		// StopLoss:    Buy               Sell
-		{ob.triggerOver, ob.triggerUnder},
-		// TakeProfit:  Buy               Sell
-		{ob.triggerUnder, ob.triggerOver},
+	// Flatten 2D arrays into 1D of length 4: index = flagIdx*2 + sideIdx
+	idx := flagIdx*2 + sideIdx
+
+	// priceLevels for deferred orders:
+	pls := [4]*priceLevel{
+		ob.triggerOver,  // StopLoss + Buy
+		ob.triggerUnder, // StopLoss + Sell
+		ob.triggerUnder, // TakeProfit + Buy
+		ob.triggerOver,  // TakeProfit + Sell
 	}
 
-	// 3) true=TrigPrice<=lastPrice, false=lastPrice<=TrigPrice
-	useTrLE := [2][2]bool{
-		{true, false},
-		{false, true},
+	// Which comparison to use:
+	// true  = TrigPrice <= lastPrice
+	// false = lastPrice <= TrigPrice
+	useTrLE := [4]bool{
+		true, false,
+		false, true,
 	}
 
 	le := o.TrigPrice.LessThanOrEqual(ob.lastPrice)
 	ge := ob.lastPrice.LessThanOrEqual(o.TrigPrice)
 
-	if (useTrLE[flagIdx][sideIdx] && le) || (!useTrLE[flagIdx][sideIdx] && ge) {
+	if (useTrLE[idx] && le) || (!useTrLE[idx] && ge) {
 		ob.processOrder(o)
 	} else {
-		ob.trigOrders.Put(o.ID, pls[flagIdx][sideIdx].Append(o))
+		ob.trigOrders.Put(o.ID, pls[idx].Append(o))
 	}
 }
 
