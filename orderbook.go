@@ -19,8 +19,7 @@ var oqPool = pool.NewItemPoolV2[orderQueue](1)
 
 // OrderBook implements standard matching algorithm
 type OrderBook struct {
-	asks         *priceLevel
-	bids         *priceLevel
+	bidsAsks     [2]*priceLevel
 	triggerUnder *priceLevel                      // orders triggering under last price i.e. Stop Sell or Take Buy
 	triggerOver  *priceLevel                      // orders that trigger over last price i.e. Stop Buy or Take Sell
 	orders       *local_tree.Tree[uint64, *Order] // orderId -> *Order
@@ -31,6 +30,7 @@ type OrderBook struct {
 
 	lastPrice decimal.Decimal
 	lastToken uint64
+	cmpFuncs  [2]func(decimal.Decimal) bool
 
 	matching bool
 
@@ -41,6 +41,8 @@ type OrderBook struct {
 }
 
 // Uint64Cmp compares two uint64.
+//
+//go:inline
 func Uint64Cmp(a, b uint64) int {
 	if a == b {
 		return 0
@@ -57,8 +59,7 @@ func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 		orders:       local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
 		trigOrders:   local_tree.NewWithTree[uint64, *Order](Uint64Cmp, 1),
 		trigQueue:    newTriggerQueue(),
-		bids:         newPriceLevel(BidPrice),
-		asks:         newPriceLevel(AskPrice),
+		bidsAsks:     [2]*priceLevel{newPriceLevel(BidPrice), newPriceLevel(AskPrice)},
 		triggerUnder: newPriceLevel(TrigPrice),
 		triggerOver:  newPriceLevel(TrigPrice),
 		notification: n,
@@ -129,11 +130,11 @@ func (ob *OrderBook) AddOrder(
 	// 3) If matching is disabled, reject any limit order that would cross the book
 	if !ob.matching && class != Market {
 		crossed := (side == Buy &&
-			ob.asks.GetQueue() != nil &&
-			ob.asks.GetQueue().Price().LessThanOrEqual(price)) ||
+			ob.bidsAsks[1].GetQueue() != nil &&
+			ob.bidsAsks[1].GetQueue().Price().LessThanOrEqual(price)) ||
 			(side == Sell &&
-				ob.bids.GetQueue() != nil &&
-				ob.bids.GetQueue().Price().GreaterThanOrEqual(price))
+				ob.bidsAsks[0].GetQueue() != nil &&
+				ob.bidsAsks[0].GetQueue().Price().GreaterThanOrEqual(price))
 		if crossed {
 			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrNoMatching)
 			return
@@ -198,9 +199,8 @@ func (ob *OrderBook) postProcess(lp decimal.Decimal) {
 
 func (ob *OrderBook) processOrder(o *Order) {
 	lp := ob.lastPrice
-	priceLevelMap := [2]*priceLevel{ob.bids, ob.asks}
 
-	pl := priceLevelMap[o.Side]
+	pl := ob.bidsAsks[o.Side]
 	var cmp func(decimal.Decimal) bool
 	if o.Side == Buy {
 		cmp = o.Price.GreaterThanOrEqual
@@ -217,7 +217,7 @@ func (ob *OrderBook) processOrder(o *Order) {
 		if o.Flag&(IoC|FoK) == 0 {
 			if rem := o.Qty.Sub(executed); rem.GreaterThan(decimal.Zero) {
 				newO := NewOrder(o.ID, o.Class, o.Side, rem, o.Price, decimal.Zero, o.Flag)
-				opposite := priceLevelMap[1-o.Side]
+				opposite := ob.bidsAsks[1-o.Side]
 				ob.orders.Put(newO.ID, opposite.Append(newO))
 			}
 		}
@@ -290,7 +290,6 @@ func (ob *OrderBook) CancelOrder(tok, orderID uint64) {
 
 // CancelOrder removes order with given ID from the order book
 func (ob *OrderBook) cancelOrder(orderID uint64) *Order {
-	priceLevelMap := [2]*priceLevel{ob.asks, ob.bids}
 	o, ok := ob.orders.Get(orderID)
 	if !ok {
 		return ob.cancelTrigOrders(orderID)
@@ -298,7 +297,7 @@ func (ob *OrderBook) cancelOrder(orderID uint64) *Order {
 
 	ob.orders.Remove(orderID)
 
-	return priceLevelMap[o.Side].Remove(o)
+	return ob.bidsAsks[1-o.Side].Remove(o)
 }
 
 func (ob *OrderBook) cancelTrigOrders(orderID uint64) *Order {
@@ -340,7 +339,7 @@ func (ob *OrderBook) Ask(tok uint64) *Order {
 	if !atomic.CompareAndSwapUint64(&ob.lastToken, tok-1, tok) {
 		panic("invalid token received: cannot maintain determinism")
 	}
-	orderQueue := ob.asks.MinPriceQueue()
+	orderQueue := ob.bidsAsks[1].MinPriceQueue()
 	if orderQueue == nil {
 		return nil
 	}
@@ -372,7 +371,7 @@ func (ob *OrderBook) Bid(tok uint64) *Order {
 	if !atomic.CompareAndSwapUint64(&ob.lastToken, tok-1, tok) {
 		panic("invalid token received: cannot maintain determinism")
 	}
-	orderQueue := ob.bids.MaxPriceQueue()
+	orderQueue := ob.bidsAsks[0].MaxPriceQueue()
 	if orderQueue == nil {
 		return nil
 	}
