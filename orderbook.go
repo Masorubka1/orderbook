@@ -14,7 +14,7 @@ type NotificationHandler interface {
 	PutTrade(makerOrderID, takerOrderID uint64, makerStatus, takerStatus OrderStatus, qty, price decimal.Decimal)
 }
 
-var oPool = pool.NewItemPoolV2[Order](10)
+var oPool = pool.NewItemPoolV2[Order](100)
 var oqPool = pool.NewItemPoolV2[orderQueue](10)
 
 // OrderBook implements standard matching algorithm
@@ -85,68 +85,69 @@ func NewOrderBook(n NotificationHandler, opts ...Option) *OrderBook {
 //	flag      - immediate or cancel, all or none, fill or kill, Cancel (ob.IoC or ob.AoN or ob.FoK or ob.Cancel)
 //	* to create new decimal number you should use udecimal.New() func
 //	  read more at https://github.com/geseq/udecimal
-func (ob *OrderBook) AddOrder(tok, id uint64, class ClassType, side SideType, quantity, price, trigPrice decimal.Decimal, flag FlagType) {
+func (ob *OrderBook) AddOrder(
+	tok, id uint64,
+	class ClassType,
+	side SideType,
+	quantity, price, trigPrice decimal.Decimal,
+	flag FlagType,
+) {
+	// 1) Ensure determinism by checking the token sequence
 	if !atomic.CompareAndSwapUint64(&ob.lastToken, tok-1, tok) {
 		panic("invalid token received: cannot maintain determinism")
 	}
 
+	// 2) Basic validations
 	if quantity.Equal(decimal.Zero) {
 		ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrInvalidQuantity)
 		return
 	}
 
-	if !ob.matching {
-		// If matching is disabled reject all orders that cross the book
-		if class == Market {
-			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrNoMatching)
-			return
-		}
-
-		if side == Buy {
-			q := ob.asks.GetQueue()
-			if q != nil && q.Price().LessThanOrEqual(price) {
-				ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrNoMatching)
-				return
-			}
-		} else {
-			q := ob.bids.GetQueue()
-			if q != nil && q.Price().GreaterThanOrEqual(price) {
-				ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrNoMatching)
-
-				return
-			}
-		}
-	}
-
-	if flag&(StopLoss|TakeProfit) != 0 {
+	// Determine if this is a stop/take order
+	isTrigger := flag&(StopLoss|TakeProfit) != 0
+	if isTrigger {
+		// Trigger orders must have a non-zero trigger price
 		if trigPrice.IsZero() {
 			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrInvalidTriggerPrice)
 			return
 		}
-
-		ob.notification.PutOrder(MsgCreateOrder, Accepted, id, quantity, nil)
-		o := NewOrder(id, class, side, quantity, price, trigPrice, flag)
-		ob.addTrigOrder(o)
-		return
-	}
-
-	if class != Market {
-		if _, ok := ob.orders.Get(id); ok {
+	} else if class != Market {
+		// For limit orders: reject duplicates
+		if _, exists := ob.orders.Get(id); exists {
 			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, decimal.Zero, ErrOrderExists)
 			return
 		}
-
+		// For limit orders: price must be non-zero
 		if price.Equal(decimal.Zero) {
 			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, decimal.Zero, ErrInvalidPrice)
 			return
 		}
 	}
 
+	// 3) If matching is disabled, reject any limit order that would cross the book
+	if !ob.matching && class != Market {
+		crossed := (side == Buy &&
+			ob.asks.GetQueue() != nil &&
+			ob.asks.GetQueue().Price().LessThanOrEqual(price)) ||
+			(side == Sell &&
+				ob.bids.GetQueue() != nil &&
+				ob.bids.GetQueue().Price().GreaterThanOrEqual(price))
+		if crossed {
+			ob.notification.PutOrder(MsgCreateOrder, Rejected, id, quantity, ErrNoMatching)
+			return
+		}
+	}
+
+	// 4) Accept the order and notify
 	ob.notification.PutOrder(MsgCreateOrder, Accepted, id, quantity, nil)
 	o := NewOrder(id, class, side, quantity, price, trigPrice, flag)
-	ob.processOrder(o)
 
-	return
+	// 5) Route to trigger handling or immediate processing
+	if isTrigger {
+		ob.addTrigOrder(o)
+	} else {
+		ob.processOrder(o)
+	}
 }
 
 func (ob *OrderBook) addTrigOrder(o *Order) {
@@ -240,7 +241,7 @@ func (ob *OrderBook) queueTriggeredOrders() {
 func (ob *OrderBook) processTriggeredOrders() {
 	for o := ob.trigQueue.Pop(); o != nil; o = ob.trigQueue.Pop() {
 		ob.processOrder(o)
-		oPool.Put(o)
+		o.Release()
 	}
 }
 
@@ -278,20 +279,18 @@ func (ob *OrderBook) CancelOrder(tok, orderID uint64) {
 // CancelOrder removes order with given ID from the order book
 func (ob *OrderBook) cancelOrder(orderID uint64) *Order {
 	o, ok := ob.orders.Get(orderID)
+	priceLevelMap := [2]*priceLevel{ob.asks, ob.bids}
 	if !ok {
 		return ob.cancelTrigOrders(orderID)
 	}
 
 	ob.orders.Remove(orderID)
 
-	if o.Side == Buy {
-		return ob.bids.Remove(o)
-	}
-
-	return ob.asks.Remove(o)
+	return priceLevelMap[o.Side].Remove(o)
 }
 
 func (ob *OrderBook) cancelTrigOrders(orderID uint64) *Order {
+	triggerLevelMap := [2]*priceLevel{ob.triggerUnder, ob.triggerOver}
 	o, ok := ob.trigOrders.Get(orderID)
 	if !ok {
 		return nil
@@ -299,17 +298,11 @@ func (ob *OrderBook) cancelTrigOrders(orderID uint64) *Order {
 
 	ob.trigOrders.Remove(orderID)
 
-	if (o.Flag & StopLoss) != 0 {
-		if o.Side == Buy {
-			return ob.triggerOver.Remove(o)
-		}
-		return ob.triggerUnder.Remove(o)
+	if (o.Flag & StopLoss) == 0 {
+		return triggerLevelMap[1-o.Side].Remove(o)
 	}
 
-	if o.Side == Buy {
-		return ob.triggerUnder.Remove(o)
-	}
-	return ob.triggerOver.Remove(o)
+	return triggerLevelMap[o.Side].Remove(o)
 }
 
 // Ask returns the best (lowest priced) sell order (Ask) from the order book.
